@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <queue>
 #include <vector>
+#include <unistd.h>
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
@@ -55,7 +56,10 @@ class Pool
             try {
                 transport->open();
 
-                client.save_data("acs_2004", "0cd537e4", a, b);
+                int res = client.save_data("acs_2004", "0cd537e4", a, b);
+
+                if (!res) cout << "success" << endl;
+                else cout << "failed" << endl;
 
                 transport->close();
             } catch (TException& tx) {
@@ -67,11 +71,25 @@ class Pool
         {
             while (users.size() > 1)
             {
-                auto a = users[0], b = users[1];
-                users.erase(users.begin());
-                users.erase(users.begin());
+                sort(users.begin(), users.end(), [&](User &a, User &b){
+                        return a.score < b.score;
+                        });
 
-                save_result(a.id, b.id);    // 保存匹配结果
+                bool flag = true;
+                for (uint32_t i = 1; i < users.size(); i ++ )
+                {
+                    auto a = users[i - 1], b = users[i];
+                    if (b.score - a.score <= 50)
+                    {
+                        users.erase(users.begin() + i - 1, users.begin() + i + 1);
+                        save_result(a.id, b.id);    // 保存匹配结果
+
+                        flag = false;
+                        break;
+                    }
+                }
+
+                if (flag) break;
             }
         }
 
@@ -150,8 +168,9 @@ void consume_task()
         unique_lock<mutex> lck(message_queue.m);
         if (message_queue.q.empty())
         {
-            // 如果不阻塞住，会一直循环，占用CPU
-            message_queue.cv.wait(lck); // 将自身阻塞，等待被唤醒
+            // 如果队列为空，则解锁，并且睡眠1秒
+            lck.unlock();
+            sleep(1);
         }
         else
         {
