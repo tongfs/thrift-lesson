@@ -18,7 +18,6 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
-#include <condition_variable>
 #include <queue>
 #include <vector>
 #include <unistd.h>
@@ -43,7 +42,6 @@ struct MessageQueue
 {
     queue<Task> q;
     mutex m;
-    condition_variable cv;
 }message_queue;
 
 class Pool
@@ -72,51 +70,79 @@ class Pool
             }
         }
 
+        bool check_match(uint32_t i, uint32_t j)
+        {
+            int dt = abs(users[i].score - users[j].score);
+            int span_a = wt[i] * 50, span_b = wt[j] * 50;
+            return dt <= span_a && dt <= span_b;
+        }
+
         void match()
         {
-            while (users.size() > 1)
+            while (1)
             {
-                sort(users.begin(), users.end(), [&](User &a, User &b){
-                        return a.score < b.score;
-                        });
-
-                bool flag = true;
-                for (uint32_t i = 1; i < users.size(); i ++ )
+                unique_lock<mutex> lck(m);
+                while (users.size() > 1)
                 {
-                    auto a = users[i - 1], b = users[i];
-                    if (b.score - a.score <= 50)
+                    bool flag = true;
+                    for (uint32_t i = 0; i < users.size(); i ++ )
                     {
-                        users.erase(users.begin() + i - 1, users.begin() + i + 1);
-                        save_result(a.id, b.id);    // 保存匹配结果
+                        for (uint32_t j = i + 1; j < users.size(); j ++ )
+                        {
+                            auto a = users[i], b = users[j];
+                            if (check_match(i, j))
+                            {
+                                users.erase(users.begin() + j);
+                                users.erase(users.begin() + i);
+                                wt.erase(wt.begin() + j);
+                                wt.erase(wt.begin() + i);
+                                save_result(a.id, b.id);
 
-                        flag = false;
-                        break;
+                                flag = false;
+                                break;
+                            }
+                        }
+                        if (!flag) break;
                     }
+                    if (flag) break;
                 }
 
-                if (flag) break;
+                // 暂时无匹配的对手，增加1秒的wt
+                for (uint32_t i = 0; i < wt.size(); i ++ )
+                    wt[i] ++ ;
+
+                lck.unlock();
+                sleep(1);
             }
         }
 
         void add(User user)
         {
+            unique_lock<mutex> lck(m);
             users.push_back(user);
+            wt.push_back(0);
+            lck.unlock();
         }
 
         void remove(User user)
         {
+            unique_lock<mutex> lck(m);
             for (uint32_t i = 0; i < users.size(); i ++ )
             {
                 if (users[i].id == user.id)
                 {
                     users.erase(users.begin() + i);
+                    wt.erase(wt.begin() + i);
                     break;
                 }
             }
+            lck.unlock();
         }
 
     private:
         vector<User> users;
+        vector<int> wt;
+        mutex m;
 }pool;
 
 class MatchHandler : virtual public MatchIf {
@@ -139,7 +165,6 @@ class MatchHandler : virtual public MatchIf {
 
             unique_lock<mutex> lck(message_queue.m);    // 变量销毁时，会自动释放锁
             message_queue.q.push({user, "add"});
-            message_queue.cv.notify_all();  // 唤醒所有等待的线程
 
             return 0;
         }
@@ -158,7 +183,6 @@ class MatchHandler : virtual public MatchIf {
 
             unique_lock<mutex> lck(message_queue.m);
             message_queue.q.push({user, "remove"});
-            message_queue.cv.notify_all();
 
             return 0;
         }
@@ -189,6 +213,8 @@ void consume_task()
 {
     while (true)
     {
+        // 原本以为这里的加锁和解锁好像并不是很有必要
+        // 但是联系 Handler 里的内容来看，好像还是应该有的
         unique_lock<mutex> lck(message_queue.m);
         if (message_queue.q.empty())
         {
@@ -205,10 +231,14 @@ void consume_task()
             // do task
             if (task.type == "add") pool.add(task.user);
             else if (task.type == "remove") pool.remove(task.user);
-
-            pool.match();
         }
     }
+}
+
+
+void match_task()
+{
+    pool.match();
 }
 
 
@@ -221,7 +251,8 @@ int main(int argc, char **argv) {
 
     cout << "match server starts!" << endl;
 
-    thread match_thread(consume_task);
+    thread consume_thread(consume_task);
+    thread match_thread(match_task);
 
     server.serve();
     return 0;
